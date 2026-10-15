@@ -148,6 +148,36 @@ func (d *DB) ListFindingRetests(findingID int64) ([]*FindingRetest, error) {
 	return out, rows.Err()
 }
 
+// LoadFindingRetestsForExport loads history in one query, restricted to exported
+// findings. Snapshot is intentionally excluded: it contains agent-only context.
+func (d *DB) LoadFindingRetestsForExport(ctx context.Context, findings []*DBFinding) error {
+	if len(findings) == 0 {
+		return nil
+	}
+	ids := make([]int64, 0, len(findings))
+	byID := make(map[int64][]*DBFinding, len(findings))
+	for _, f := range findings {
+		ids = append(ids, f.ID)
+		byID[f.ID] = append(byID[f.ID], f)
+		f.Retests = nil
+	}
+	rows, err := d.QueryContext(ctx, `SELECT `+retestCols+` FROM finding_retests WHERE finding_id = ANY($1::bigint[]) ORDER BY finding_id, id DESC`, ids)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		r, err := scanRetest(rows)
+		if err != nil {
+			return err
+		}
+		for _, f := range byID[r.FindingID] {
+			f.Retests = append(f.Retests, r)
+		}
+	}
+	return rows.Err()
+}
+
 func (d *DB) FindingRetestForConversation(ctx context.Context, conversationID int64) (*FindingRetest, error) {
 	r, err := scanRetest(d.QueryRowContext(ctx, `SELECT `+retestCols+` FROM finding_retests WHERE conversation_id=$1`, conversationID))
 	if err != nil || r == nil {

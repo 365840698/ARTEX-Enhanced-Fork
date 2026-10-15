@@ -1,0 +1,39 @@
+name: tests
+on:
+  pull_request:
+  push:
+    branches: [main, 'codex/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: artex
+          POSTGRES_PASSWORD: artex_test
+          POSTGRES_DB: artex_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U artex -d artex_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      ARTEX_PG_DSN: postgres://artex:artex_test@localhost:5432/artex_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test report rendering
+        run: go test -race ./report
+      - name: Test database export history
+        run: go test ./db -run TestLoadFindingRetestsForExport -count=1
+      - name: Test export API validation
+        run: go test ./server -run TestFindingExport -count=1
+      - name: Compile all packages
+        run: go build ./...

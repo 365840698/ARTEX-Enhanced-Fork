@@ -240,3 +240,34 @@ func TestRetestFixedTriageOnlyAfterSuccessfulCompletion(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadFindingRetestsForExport(t *testing.T) {
+	d, fid := retestDB(t)
+	r, _, _, err := d.CreateFindingRetest(t.Context(), fid, "export condition")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := &DBFinding{ID: fid}
+	empty := &DBFinding{ID: -1}
+	if err := d.LoadFindingRetestsForExport(t.Context(), []*DBFinding{f, empty}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Retests) != 1 || f.Retests[0].ID != r.ID || f.Retests[0].Notes != "export condition" {
+		t.Fatalf("history: %+v", f.Retests)
+	}
+	if len(f.Retests[0].Snapshot) != 0 {
+		t.Fatal("agent snapshot leaked")
+	}
+	if len(empty.Retests) != 0 {
+		t.Fatal("cross-finding history leak")
+	}
+	if err := d.LoadFindingRetestsForExport(t.Context(), []*DBFinding{f}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Retests) != 1 {
+		t.Fatal("history duplicated on reload")
+	}
+	if err := d.LoadFindingRetestsForExport(t.Context(), nil); err != nil {
+		t.Fatal(err)
+	}
+}

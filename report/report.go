@@ -78,12 +78,13 @@ func Markdown(in Input) string {
 		for _, n := range in.Findings {
 			fs = append(fs, parseFinding(n))
 		}
-		sort.SliceStable(fs, func(i, j int) bool { return sevRank[fs[i].Severity] < sevRank[fs[j].Severity] })
+		sort.SliceStable(fs, func(i, j int) bool { return severityRank(fs[i].Severity) < severityRank(fs[j].Severity) })
 		for i, f := range fs {
 			fmt.Fprintf(&b, "### %d. [%s] %s\n\n", i+1, strings.ToUpper(nz(f.Severity, "info")), nz(f.Name, nz(f.VulnClass, "未分类")))
 			fmt.Fprintf(&b, "%s\n\n", nz(f.Summary, ""))
 			if f.PoC != "" {
-				fmt.Fprintf(&b, "**PoC / 证据：**\n\n```\n%s\n```\n\n", f.PoC)
+				b.WriteString("**PoC / 证据：**\n\n")
+				b.WriteString(evidenceBlock(f.PoC))
 			}
 		}
 	}
@@ -96,4 +97,30 @@ func nz(s, d string) string {
 		return d
 	}
 	return s
+}
+
+// Unknown and informational severities follow all known risk levels.
+func severityRank(severity string) int {
+	if rank, ok := sevRank[strings.ToLower(strings.TrimSpace(severity))]; ok {
+		return rank
+	}
+	return 4
+}
+
+// Evidence can itself contain Markdown fences. Use a longer fence so captured
+// requests and model output cannot terminate their own literal block.
+func evidenceBlock(text string) string {
+	longest, run := 0, 0
+	for _, ch := range text {
+		if ch == '`' {
+			run++
+			if run > longest {
+				longest = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	fence := strings.Repeat("`", max(3, longest+1))
+	return fence + "\n" + text + "\n" + fence + "\n\n"
 }

@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/Autumn-27/artex/db"
 )
@@ -19,9 +21,12 @@ import (
 // sortFindingsForExport 按严重等级降序、再按时间倒序排,与汇总报告的分组一致。
 func sortFindingsForExport(fs []*db.DBFinding) {
 	sort.SliceStable(fs, func(i, j int) bool {
-		ri, rj := sevRank[fs[i].Severity], sevRank[fs[j].Severity]
+		ri, rj := severityRank(fs[i].Severity), severityRank(fs[j].Severity)
 		if ri != rj {
 			return ri < rj // sevRank 越小越严重
+		}
+		if fs[i].CreatedAt.Equal(fs[j].CreatedAt) {
+			return fs[i].ID > fs[j].ID
 		}
 		return fs[i].CreatedAt.After(fs[j].CreatedAt)
 	})
@@ -46,7 +51,7 @@ func FindingsMarkdown(fs []*db.DBFinding, generatedAt time.Time) string {
 	// 摘要:各严重等级计数。
 	counts := map[string]int{}
 	for _, f := range items {
-		counts[f.Severity]++
+		counts[strings.ToLower(strings.TrimSpace(f.Severity))]++
 	}
 	b.WriteString("## 摘要\n\n")
 	b.WriteString("| 严重等级 | 数量 |\n| --- | --- |\n")
@@ -54,6 +59,10 @@ func FindingsMarkdown(fs []*db.DBFinding, generatedAt time.Time) string {
 		{"critical", "严重"}, {"high", "高危"}, {"medium", "中危"}, {"low", "低危"},
 	} {
 		fmt.Fprintf(&b, "| %s | %d |\n", s.label, counts[s.key])
+	}
+	other := len(items) - counts["critical"] - counts["high"] - counts["medium"] - counts["low"]
+	if other > 0 {
+		fmt.Fprintf(&b, "| 信息 / 未分类 | %d |\n", other)
 	}
 	b.WriteString("\n")
 
@@ -77,13 +86,15 @@ func FindingsMarkdown(fs []*db.DBFinding, generatedAt time.Time) string {
 			fmt.Fprintf(&b, "%s\n\n", s)
 		}
 		if e := strings.TrimSpace(f.Evidence); e != "" {
-			fmt.Fprintf(&b, "**证据：**\n\n```\n%s\n```\n\n", e)
+			b.WriteString("**证据：**\n\n")
+			b.WriteString(evidenceBlock(e))
 		}
 		if rep := strings.TrimSpace(f.Report); rep != "" {
 			b.WriteString("**详细报告：**\n\n")
 			b.WriteString(rep)
 			b.WriteString("\n\n")
 		}
+		b.WriteString(findingRetestsMarkdown(f, "####"))
 		b.WriteString(findingTrafficMarkdown(f, false))
 		b.WriteString("---\n\n")
 	}
@@ -108,13 +119,15 @@ func SingleFindingMarkdown(f *db.DBFinding, generatedAt time.Time) string {
 		fmt.Fprintf(&b, "## 概述\n\n%s\n\n", s)
 	}
 	if e := strings.TrimSpace(f.Evidence); e != "" {
-		fmt.Fprintf(&b, "## 证据\n\n```\n%s\n```\n\n", e)
+		b.WriteString("## 证据\n\n")
+		b.WriteString(evidenceBlock(e))
 	}
 	if rep := strings.TrimSpace(f.Report); rep != "" {
 		b.WriteString("## 详细报告\n\n")
 		b.WriteString(rep)
 		b.WriteString("\n")
 	}
+	b.WriteString(findingRetestsMarkdown(f, "##"))
 	b.WriteString(findingTrafficMarkdown(f, true))
 	return b.String()
 }
@@ -122,21 +135,25 @@ func SingleFindingMarkdown(f *db.DBFinding, generatedAt time.Time) string {
 var unsafeFilenameChars = regexp.MustCompile(`[^\p{Han}\p{L}\p{N}._-]+`)
 
 // FindingFilename 为「一漏洞一文件」生成安全的 .md 文件名,形如
-// `critical_SQL注入_#123.md`。去掉路径分隔符与控制字符,避免 zip 内非法路径。
+// `critical_SQL注入_123.md`。去掉路径分隔符与控制字符,避免 zip 内非法路径。
 func FindingFilename(f *db.DBFinding) string {
 	sev := nz(f.Severity, "info")
 	title := findingTitle(f)
-	name := fmt.Sprintf("%s_%s_#%d", sev, title, f.ID)
-	name = unsafeFilenameChars.ReplaceAllString(name, "_")
-	name = strings.Trim(name, "._")
+	name := unsafeFilenameChars.ReplaceAllString(sev+"_"+title, "_")
+	name = strings.Trim(path.Base(name), "._")
 	if name == "" {
-		name = fmt.Sprintf("finding_%d", f.ID)
+		name = "finding"
 	}
-	// 防御性:再剥一层路径,杜绝 zip slip。
-	name = path.Base(name)
-	if len(name) > 120 {
-		name = name[:120]
+	// Keep the unique ID outside the truncated title and preserve UTF-8.
+	suffix := fmt.Sprintf("_%d", f.ID)
+	limit := 120 - len(suffix)
+	if len(name) > limit {
+		name = name[:limit]
+		for !utf8.ValidString(name) {
+			name = name[:len(name)-1]
+		}
 	}
+	name += suffix
 	return name + ".md"
 }
 
@@ -149,9 +166,16 @@ func FindingsCSV(fs []*db.DBFinding) []byte {
 	var buf bytes.Buffer
 	buf.WriteString("\xEF\xBB\xBF") // UTF-8 BOM
 	w := csv.NewWriter(&buf)
-	_ = w.Write([]string{"ID", "名称", "类别", "严重等级", "状态", "所属任务", "发现时间", "概述", "流量证据数量", "流量证据ID"})
+	_ = w.Write([]string{"ID", "名称", "类别", "严重等级", "状态", "所属任务", "发现时间", "概述", "流量证据数量", "流量证据ID", "复测次数", "最近复测状态", "最近复测结论"})
 	for _, f := range items {
-		_ = w.Write([]string{
+		latestStatus, latestVerdict := "", ""
+		if len(f.Retests) > 0 {
+			latestStatus = f.Retests[0].Status
+			if latestStatus == "completed" {
+				latestVerdict = f.Retests[0].Verdict
+			}
+		}
+		row := []string{
 			fmt.Sprintf("%d", f.ID),
 			findingTitle(f),
 			f.VulnClass,
@@ -159,9 +183,14 @@ func FindingsCSV(fs []*db.DBFinding) []byte {
 			nz(f.Status, "pending"),
 			f.TaskDescription,
 			f.CreatedAt.Format("2006-01-02 15:04:05"),
-			strings.TrimSpace(f.Summary),
+			f.Summary,
 			fmt.Sprint(len(f.TrafficBindings)), findingTrafficIDs(f),
-		})
+			fmt.Sprint(len(f.Retests)), latestStatus, latestVerdict,
+		}
+		for i, value := range row {
+			row[i] = spreadsheetCell(value)
+		}
+		_ = w.Write(row)
 	}
 	w.Flush()
 	return buf.Bytes()
@@ -197,4 +226,61 @@ func findingTrafficMarkdown(f *db.DBFinding, attachments bool) string {
 	}
 	out.WriteString("\n")
 	return out.String()
+}
+
+// Neutralize formulas even when hidden behind leading whitespace/control bytes.
+func spreadsheetCell(value string) string {
+	trimmed := strings.TrimLeftFunc(value, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) })
+	if strings.HasPrefix(value, "\t") || strings.HasPrefix(value, "\r") || strings.HasPrefix(value, "\n") ||
+		(len(trimmed) > 0 && strings.ContainsRune("=+-@", rune(trimmed[0]))) {
+		return "'" + value
+	}
+	return value
+}
+
+func findingRetestsMarkdown(f *db.DBFinding, heading string) string {
+	if len(f.Retests) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "\n%s 复测历史\n\n", heading)
+	for _, r := range f.Retests {
+		fmt.Fprintf(&b, "- **复测 #%d**：状态 `%s`；创建时间 %s\n", r.ID, r.Status, r.CreatedAt.Format("2006-01-02 15:04:05"))
+		if r.FinishedAt != nil {
+			fmt.Fprintf(&b, "  - 结束时间：%s\n", r.FinishedAt.Format("2006-01-02 15:04:05"))
+		}
+		if r.ConversationID != nil {
+			fmt.Fprintf(&b, "  - 会话 ID：%d\n", *r.ConversationID)
+		}
+		if r.Verdict != "" {
+			label := "暂存结论（未成功完成，不作为修复依据）"
+			if r.Status == "completed" {
+				label = "结论"
+			}
+			fmt.Fprintf(&b, "  - %s：%s\n", label, retestVerdictLabel(r.Verdict))
+		}
+		b.WriteString("\n")
+		for _, field := range []struct{ label, value string }{
+			{"复测条件 / 备注", r.Notes}, {"复测摘要", r.Summary}, {"复测证据", r.Evidence}, {"中断 / 错误原因", r.Error},
+		} {
+			if strings.TrimSpace(field.value) != "" {
+				fmt.Fprintf(&b, "**%s：**\n\n", field.label)
+				b.WriteString(evidenceBlock(field.value))
+			}
+		}
+	}
+	return b.String()
+}
+
+func retestVerdictLabel(verdict string) string {
+	switch verdict {
+	case "fixed":
+		return "已修复"
+	case "reproduced":
+		return "仍可复现"
+	case "inconclusive":
+		return "无法确认"
+	default:
+		return verdict
+	}
 }

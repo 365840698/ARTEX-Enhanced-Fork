@@ -15,6 +15,8 @@ import (
 // DBFinding is a row in the standalone findings table. It persists across task
 // deletion unless the caller explicitly requests related finding cleanup.
 type DBFinding struct {
+	Retests []*FindingRetest // populated only for export; excludes agent snapshots
+
 	TrafficCount          int
 	EvidenceVersion       int64
 	ReportEvidenceVersion int64

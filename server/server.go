@@ -2103,6 +2103,14 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 	scope := q.Get("scope")
 	format := q.Get("format")
 
+	// Validate before querying or staging evidence (invalid requests need no I/O).
+	switch format {
+	case "md-single", "md-zip", "csv", "json":
+	default:
+		writeErr(w, 400, "bad format: "+format)
+		return
+	}
+
 	var ids []int64
 	var filter db.FindingFilter
 	switch scope {
@@ -2134,6 +2142,11 @@ func (s *Server) findingsExport(w http.ResponseWriter, r *http.Request) {
 
 	fs, err := s.m.pg.ListFindingsForExport(filter, ids)
 	if err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
+
+	if err := s.m.pg.LoadFindingRetestsForExport(r.Context(), fs); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
