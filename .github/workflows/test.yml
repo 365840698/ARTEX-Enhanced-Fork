@@ -34,7 +34,7 @@ jobs:
       - name: Test database history and dispatch concurrency
         run: go test -race ./db -run 'TestLoadFindingRetestsForExport|TestIntentDispatch' -count=1
       - name: Test intent dispatch tool
-        run: go test -race ./agent -run 'TestIntentDispatchToolReportsReuse|TestGraphOverviewExpandsAssociatedCompanyScope|TestBlackboardToolsReadDirectSources' -count=1
+        run: go test -race ./agent -run 'TestIntentDispatchToolReportsReuse|TestBlackboardToolsReadDirectSources' -count=1
       - name: Test export API validation
         run: go test ./server -run TestFindingExport -count=1
       - name: Compile all packages

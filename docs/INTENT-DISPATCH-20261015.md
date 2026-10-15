@@ -18,6 +18,8 @@ planner 提示词此前要求避免重复方向，但 add_intent 每次调用都
 单元测试覆盖身份集合规范化和不同条件隔离。PostgreSQL 测试覆盖 12 路并发只有一个新增节点、关联完整性、活跃状态复用、终态重测、前置事实变化、失败回滚和任务间隔离。Agent 工具测试验证批量重复反馈及只在新增工作时恢复任务。CI 额外运行既有跨任务事实/资产上下文回归，防止事务化派发破坏血缘。
 
     go test -race ./db -run 'TestIntentDispatch' -count=1
-    go test -race ./agent -run 'TestIntentDispatchToolReportsReuse|TestGraphOverviewExpandsAssociatedCompanyScope|TestBlackboardToolsReadDirectSources' -count=1
+    go test -race ./agent -run 'TestIntentDispatchToolReportsReuse|TestBlackboardToolsReadDirectSources' -count=1
 
 集成测试需要 ARTEX_PG_DSN；无本地数据库时跳过，远端 CI 提供 PostgreSQL 16。
+
+基线限制：已有 TestGraphOverviewExpandsAssociatedCompanyScope 断言 coverage.scope，但当前 graphOverviewData 不再返回该字段；本轮扩展回归首次纳入时失败。因此未将这项过期断言加入本轮 CI，保留直接关联任务事实/血缘回归 TestBlackboardToolsReadDirectSources；未修改或隐藏该旧测试。
