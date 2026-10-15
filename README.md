@@ -16,6 +16,8 @@ AI 自主渗透测试系统（Go 后端 + Next.js 前端）
 
 ---
 
+> 调度增强：[活跃意图去重与事务化派发](docs/INTENT-DISPATCH-20261015.md)，减少并发/重试造成的重复工作，并保留新条件与终态复测入口。
+
 ## 截图预览
 
 > 完整交互见[在线 Demo](https://artex-demo.vercel.app/)。

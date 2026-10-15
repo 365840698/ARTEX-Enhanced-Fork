@@ -1384,3 +1384,8 @@ CREATE INDEX IF NOT EXISTS idx_notification_deliveries_batch
     ON notification_deliveries(batch_id) WHERE batch_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_notification_deliveries_channel
     ON notification_deliveries(channel_id, id DESC);
+
+-- Planner dispatch idempotency lookup (legacy nodes remain unchanged).
+CREATE INDEX IF NOT EXISTS idx_expnodes_dispatch_key
+ON exploration_nodes(exploration_id, (payload->>'_dispatch_key'))
+WHERE kind='intent' AND state IN ('open','running','paused');
