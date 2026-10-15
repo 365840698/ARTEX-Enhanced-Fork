@@ -42,6 +42,10 @@ const RankActive = int(^uint(0)>>1) - 1
 // ErrExhausted is returned when every member of the chain failed.
 var ErrExhausted = errors.New("LLM 轮询：所有配置均不可用")
 
+// ErrIncompleteStream means a provider ended without a message-stop event.
+// It is safe to fail over only if no events have reached the caller.
+var ErrIncompleteStream = errors.New("LLM stream ended without message_stop")
+
 // Pool is an llm.Provider that fails over across an ordered chain of members.
 // It is safe for concurrent use: members are immutable after construction and
 // all mutable state lives in the shared Registry.
@@ -80,34 +84,60 @@ func (p *Pool) Head() *Member { return p.members[0] }
 // credit, 401 bad key, 429, 5xx) all surface during request establishment,
 // before the body is read, so they always land in the safe window.
 func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[llm.StreamEvent, error] {
-	order := p.order(req)
 	return func(yield func(llm.StreamEvent, error) bool) {
+		order := p.order(req)
 		var lastErr error
 		for i, m := range order {
-			emitted := false
+			if err := ctx.Err(); err != nil {
+				yield(llm.StreamEvent{}, err)
+				return
+			}
+			emitted, stopped := false, false
 			var failed error
 			for ev, err := range m.Prov.Stream(ctx, req) {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					yield(llm.StreamEvent{}, ctxErr)
+					return
+				}
 				if err != nil && !emitted && shouldFailover(ctx, err) {
 					failed = err
 					break // safe window: nothing reached the caller yet
 				}
+				if err != nil {
+					// Partial output must never be replayed, but backend failures
+					// still count toward health for subsequent requests.
+					if shouldFailover(ctx, err) {
+						p.recordFailure(m, err)
+					}
+					yield(ev, err)
+					return
+				}
 				emitted = true
-				if !yield(ev, err) {
+				if ev.Type == llm.SEMessageStop {
+					stopped = true
+				}
+				if !yield(ev, nil) {
 					return // caller stopped consuming (cancel / early exit)
 				}
-				if err != nil {
-					return // terminal error already handed to the caller
+			}
+			if err := ctx.Err(); err != nil {
+				yield(llm.StreamEvent{}, err)
+				return
+			}
+			if failed == nil && !stopped {
+				failed = ErrIncompleteStream
+				if emitted {
+					p.recordFailure(m, failed)
+					yield(llm.StreamEvent{}, failed)
+					return
 				}
 			}
 			if failed == nil {
-				p.health.Pass(m.ID) // completed (or failed in a non-failover way)
+				p.health.Pass(m.ID) // only a successfully completed stream proves recovery
 				return
 			}
 			lastErr = failed
-			hard := isHardFailure(failed)
-			if p.health.Trip(m.ID, trimErr(failed), hard) {
-				log.Printf("[llmpool] 配置 %q(%s) 已熔断：%s", m.Name, m.Model, trimErr(failed))
-			}
+			p.recordFailure(m, failed)
 			if i+1 < len(order) {
 				n := order[i+1]
 				log.Printf("[llmpool] LLM 故障转移：%q(%s) → %q(%s)，原因：%s",
@@ -118,7 +148,7 @@ func (p *Pool) Stream(ctx context.Context, req llm.CompletionRequest) iter.Seq2[
 			lastErr = ErrExhausted
 		}
 		log.Printf("[llmpool] 轮询链已耗尽(%d 个配置全部失败)，最后错误：%s", len(order), trimErr(lastErr))
-		yield(llm.StreamEvent{}, fmt.Errorf("%w：%v", ErrExhausted, lastErr))
+		yield(llm.StreamEvent{}, fmt.Errorf("%w：%w", ErrExhausted, lastErr))
 	}
 }
 
@@ -131,7 +161,13 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 	order := p.order(req)
 	var lastErr error
 	for i, m := range order {
+		if err := ctx.Err(); err != nil {
+			return llm.Message{}, "", llm.Usage{}, err
+		}
 		msg, sr, usage, err := m.Prov.Complete(ctx, req)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return llm.Message{}, "", llm.Usage{}, ctxErr
+		}
 		if err == nil {
 			p.health.Pass(m.ID)
 			return msg, sr, usage, nil
@@ -139,14 +175,11 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 		if !shouldFailover(ctx, err) {
 			// Non-failover error (e.g. ctx cancel, deterministic 4xx): surface as-is
 			// without tripping health, matching Stream's non-failover path.
-			p.health.Pass(m.ID)
+			// Cancellation and request errors say nothing about recovery.
 			return llm.Message{}, "", llm.Usage{}, err
 		}
 		lastErr = err
-		hard := isHardFailure(err)
-		if p.health.Trip(m.ID, trimErr(err), hard) {
-			log.Printf("[llmpool] 配置 %q(%s) 已熔断：%s", m.Name, m.Model, trimErr(err))
-		}
+		p.recordFailure(m, err)
 		if i+1 < len(order) {
 			n := order[i+1]
 			log.Printf("[llmpool] LLM 故障转移：%q(%s) → %q(%s)，原因：%s",
@@ -157,7 +190,15 @@ func (p *Pool) Complete(ctx context.Context, req llm.CompletionRequest) (llm.Mes
 		lastErr = ErrExhausted
 	}
 	log.Printf("[llmpool] 轮询链已耗尽(%d 个配置全部失败)，最后错误：%s", len(order), trimErr(lastErr))
-	return llm.Message{}, "", llm.Usage{}, fmt.Errorf("%w：%v", ErrExhausted, lastErr)
+	return llm.Message{}, "", llm.Usage{}, fmt.Errorf("%w：%w", ErrExhausted, lastErr)
+}
+
+// recordFailure updates shared health even when the current stream cannot
+// safely fail over. Cancellation and request errors are filtered by the caller.
+func (p *Pool) recordFailure(m *Member, err error) {
+	if p.health.Trip(m.ID, trimErr(err), isHardFailure(err)) {
+		log.Printf("[llmpool] 配置 %q(%s) 已熔断：%s", m.Name, m.Model, trimErr(err))
+	}
 }
 
 // order picks the members to try, in order: skip those in a cooling-off window
