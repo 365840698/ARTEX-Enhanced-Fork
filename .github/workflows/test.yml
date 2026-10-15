@@ -29,8 +29,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Test report rendering
-        run: go test -race ./report
+      - name: Test report and LLM reliability
+        run: go test -race ./report ./llmpool
       - name: Test database export history
         run: go test ./db -run TestLoadFindingRetestsForExport -count=1
       - name: Test export API validation
